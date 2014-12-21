@@ -8,7 +8,7 @@ import akka.testkit.{ TestActorRef, TestProbe }
 import akka.persistence.{ Update => PersistenceUpdate }
 import io.really.CommandError.ParentNotFound
 import io.really.Request.{ Update, Delete, Create }
-import io.really.Result.{ UpdateResult, CreateResult }
+import io.really.Result.{ UpdateResult, CreateResult, DeleteResult }
 import io.really.fixture.PersistentModelStoreFixture
 import io.really.model.CollectionActor.{ GetExistenceState, GetState, State }
 import io.really.model.persistent.ModelRegistry.RequestModel.GetModel
@@ -461,6 +461,27 @@ class CollectionActorSpec extends BaseActorSpec {
     val body = UpdateBody(List(UpdateOp(UpdateCommand.Set, "name", JsString("Amal"))))
     globals.collectionActor.tell(Update(ctx, r, 10l, body), probe.ref)
     probe.expectMsg(CommandError.OutdatedRevision)
+  }
+
+  "Delete" should "return ObjectNotFound for non existing objects" in {
+    val r = R / 'users / 10410
+    globals.collectionActor.tell(Delete(ctx, r), self)
+    expectMsg(CommandError.ObjectNotFound(r))
+  }
+
+  it should "return Deleted for existing objects" in {
+    val r = R / 'users / 123123
+    globals.collectionActor.tell(Create(ctx, r, Json.obj("name" -> "Tamer AbdulRadi", "age" -> 26)), system.deadLetters)
+    globals.collectionActor.tell(Delete(ctx, r), self)
+    expectMsg(DeleteResult(r))
+  }
+
+  it should "return Gone for already deleted objects" in {
+    val r = R / 'users / 123
+    globals.collectionActor.tell(Create(ctx, r, Json.obj("name" -> "Tamer Mohammed", "age" -> 26)), system.deadLetters)
+    globals.collectionActor.tell(Delete(ctx, r), system.deadLetters)
+    globals.collectionActor.tell(Delete(ctx, r), self)
+    expectMsg(CommandError.ObjectGone(r))
   }
 
 }

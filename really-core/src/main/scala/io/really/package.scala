@@ -212,9 +212,9 @@ package object really {
       lazy val default = InternalServerError("internal.server.error")
     }
 
-    case class ObjectNotFound(_r: R) extends CommandError {
+    case class ObjectGone(_r: R) extends CommandError {
       val r = Some(_r)
-      val error = Error(404, "object.missing", None)
+      val error = Error(410, "Object Gone", None)
     }
 
     case object ModelNotFound extends CommandError {

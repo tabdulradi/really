@@ -9,7 +9,7 @@ import akka.contrib.pattern.ShardRegion.Passivate
 import akka.persistence.{ RecoveryCompleted, PersistentActor }
 import akka.util.Timeout
 import _root_.io.really.CommandError._
-import _root_.io.really.Result.{ CreateResult, UpdateResult }
+import _root_.io.really.Result.{ CreateResult, UpdateResult, DeleteResult }
 import io.really._
 import _root_.io.really.Request._
 import akka.pattern.{ AskTimeoutException, ask, pipe }
@@ -110,6 +110,14 @@ class CollectionActor(globals: ReallyGlobals) extends PersistentActor with Actor
       case Event.Updated(r, ops, newRev, modelVersion, ctx) =>
         throw new IllegalStateException("Cannot update state of the data was not exist!")
 
+      case Event.Deleted(r, ctx, newRev, modelVersion, lastTouched) =>
+        state += r -> DataObject(
+          Json.obj(
+            "_r" -> r,
+            "_rev" -> newRev,
+            "_deleted" -> true
+          ), modelVersion, lastTouched
+        )
     }
 
   /**
@@ -199,6 +207,9 @@ class CollectionActor(globals: ReallyGlobals) extends PersistentActor with Actor
         case None => sender() ! ObjectNotFound(updateRequest.r)
       }
 
+    case deleteRequest: Delete =>
+      handleDeleteRequest(deleteRequest, m, sender())
+
     case ReceiveTimeout =>
       context.parent ! Passivate(stopMessage = Stop)
 
@@ -287,6 +298,30 @@ class CollectionActor(globals: ReallyGlobals) extends PersistentActor with Actor
       case error: JsError =>
         ModelValidationFailed(create.r, error)
     }
+
+  def alreadyDeleted(obj: DataObject): Boolean =
+    (obj.data \ "_deleted").validate[Boolean].getOrElse(false)
+
+  def handleDeleteRequest(request: Delete, model: Model, replyTo: ActorRef) =
+    state.get(request.r) match {
+      case None =>
+        replyTo ! ObjectNotFound(request.r)
+      case Some(obj) if alreadyDeleted(obj) =>
+        replyTo ! ObjectGone(request.r)
+      case Some(DataObject(data, modelVersion, lastTouched)) =>
+        val newRev = rev(data) + 1
+        persist(Event.Deleted(
+          request.r,
+          request.ctx,
+          newRev,
+          modelVersion,
+          lastTouched.mapValues(_ => newRev)
+        )) { event =>
+          updateState(event)
+          replyTo ! DeleteResult(request.r)
+          globals.materializerView ! CollectionViewMaterializer.UpdateProjection(bucketID)
+        }
+    }
 }
 
 object CollectionActor {
@@ -314,7 +349,8 @@ object CollectionActor {
     case class Updated(r: R, ops: List[UpdateOp], newRev: Revision, modelVersion: ModelVersion,
       context: RequestContext) extends Event
 
-    case class Deleted(r: R, context: RequestContext) extends Event
+    case class Deleted(r: R, context: RequestContext, newRev: Revision,
+      modelVersion: ModelVersion, lastUpdated: Map[FieldKey, Long]) extends Event
   }
 
   trait ValidationResponse
