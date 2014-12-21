@@ -175,13 +175,16 @@ class CollectionActor(globals: ReallyGlobals) extends PersistentActor with Actor
         case Some(obj) =>
           sender() ! AlreadyExists(r)
         case None if r.tail.isEmpty =>
-          sender() ! applyCreate(Create(ctx, r, body), m)
+          println(">>>>>>> 1 ")
+          applyCreate(Create(ctx, r, body), m, sender())
         case None =>
+          println(">>>>>>> 2 ")
           val catchTheSender = sender()
           implicit val timeout = Timeout(globals.config.CollectionActorConfig.waitForObjectState)
           (globals.collectionActor ? GetExistenceState(r.tailR)) map {
             case ObjectExists =>
-              catchTheSender ! applyCreate(Create(ctx, r, body), m)
+              println(">>>>>>> 21 ")
+              applyCreate(Create(ctx, r, body), m, catchTheSender)
             case e: ObjectNotFound =>
               catchTheSender ! ParentNotFound(r)
           } recover {
@@ -195,8 +198,9 @@ class CollectionActor(globals: ReallyGlobals) extends PersistentActor with Actor
         case Some(modelObj) if updateRequest.rev > rev(modelObj.data) =>
           sender() ! OutdatedRevision
         case Some(modelObj) =>
-          sender() ! applyUpdate(modelObj, m, updateRequest)
-        case None => sender() ! ObjectNotFound(updateRequest.r)
+          applyUpdate(modelObj, m, updateRequest)
+        case None =>
+          sender() ! ObjectNotFound(updateRequest.r)
       }
 
     case ReceiveTimeout =>
@@ -227,18 +231,20 @@ class CollectionActor(globals: ReallyGlobals) extends PersistentActor with Actor
       stash()
   }
 
-  private def applyUpdate(modelObj: DataObject, model: Model, updateReq: Request.Update): Response =
+  private def applyUpdate(modelObj: DataObject, model: Model, updateReq: Request.Update): Unit =
     getUpdatedData(modelObj, updateReq.body.ops, updateReq.rev) match {
       case JsSuccess(obj, _) =>
         validateObject(obj, model)(updateReq.ctx) match {
           case ValidationResponse.ValidData(jsObj) =>
-            persistEvent(Event.Updated(updateReq.r, updateReq.body.ops, rev(jsObj),
-              model.collectionMeta.version, updateReq.ctx), jsObj)
-            UpdateResult(updateReq.r, rev(jsObj))
+            val event = Event.Updated(updateReq.r, updateReq.body.ops, rev(jsObj), model.collectionMeta.version, updateReq.ctx)
+            persist(event) { event =>
+              updateAndPublishEvent(event, Some(jsObj))
+              sender() ! UpdateResult(updateReq.r, rev(jsObj))
+            }
           case ValidationResponse.JSValidationFailed(reason) =>
-            JSValidationFailed(updateReq.r, reason)
+            sender() ! JSValidationFailed(updateReq.r, reason)
           case ValidationResponse.ModelValidationFailed(error) =>
-            ModelValidationFailed(updateReq.r, error)
+            sender() ! ModelValidationFailed(updateReq.r, error)
         }
       case e: JsError =>
         log.debug("Failure while validating update data: " + e)
@@ -250,12 +256,10 @@ class CollectionActor(globals: ReallyGlobals) extends PersistentActor with Actor
    * @param evt
    * @param jsObj
    */
-  private def persistEvent(evt: Event, jsObj: JsObject) = {
-    persist(evt) {
-      event =>
-        updateState(event, Some(jsObj))
-        globals.materializerView ! CollectionViewMaterializer.UpdateProjection(bucketID)
-    }
+
+  private def updateAndPublishEvent(event: Event, jsObj: Option[JsObject]) = {
+    updateState(event, jsObj)
+    globals.materializerView ! CollectionViewMaterializer.UpdateProjection(bucketID)
   }
 
   private def validateObject(obj: JsObject, model: Model)(implicit context: RequestContext): ValidationResponse =
@@ -273,19 +277,28 @@ class CollectionActor(globals: ReallyGlobals) extends PersistentActor with Actor
       case (lastTouched, opBody) => lastTouched + (opBody.key -> newRev)
     }
 
-  private def applyCreate(create: Create, model: Model): Response =
+  private def applyCreate(create: Create, model: Model, replyTo: ActorRef): Unit =
     validateFields(create.body, model) match {
       case JsSuccess(jsObj, _) => // Continue to JS Validation
+        println(">>>>>>> A ")
         model.executeValidate(create.ctx, globals, jsObj) match {
           case ModelHookStatus.Succeeded =>
+            println(">>>>>>> B ")
+            println("replyTo --> " + replyTo)
             val newObj = jsObj ++ Json.obj("_rev" -> 1l, "_r" -> create.r.toString)
-            persistEvent(Event.Created(create.r, newObj, model.collectionMeta.version, create.ctx), newObj)
-            CreateResult(create.r, newObj)
+            println(">>>>>>> C ")
+            persist(Event.Created(create.r, newObj, model.collectionMeta.version, create.ctx)) { event =>
+              println(">>>>>>> D ")
+              updateAndPublishEvent(event, Some(newObj))
+              println(">>>>>>> E ")
+              replyTo ! CreateResult(create.r, newObj)
+              println(">>>>>>> F ")
+            }
           case ModelHookStatus.Terminated(code, reason) =>
-            JSValidationFailed(create.r, reason) //todo fix me, needs comprehensive reason to be communicated
+            replyTo ! JSValidationFailed(create.r, reason) //todo fix me, needs comprehensive reason to be communicated
         }
       case error: JsError =>
-        ModelValidationFailed(create.r, error)
+        replyTo ! ModelValidationFailed(create.r, error)
     }
 }
 
